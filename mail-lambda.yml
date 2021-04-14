@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Test
+
+# This sets up a simple mail service using lambda and api gateway
+# WARNING this will likely require setting up the enable-logs-global.yml CF first
+# enable-logs-global.yml policy setting for api gateway logging as mentioned here
+# https://gist.github.com/villasv/4f5b62a772abe2c06525356f80299048
+
+Parameters:
+  LambdaFunctionName:
+    Type: String
+    AllowedPattern: ^[a-zA-Z0-9]+[a-zA-Z0-9-]+[a-zA-Z0-9]+$
+    Default: printBeans
+
+Resources:
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Timeout: 60
+      MemorySize: 128
+      Runtime: nodejs12.x
+      Role: !GetAtt LambdaIAMRole.Arn
+      Handler: index.handler
+      TracingConfig:
+        Mode: Active
+      Code:
+        ZipFile: |
+          const aws = require("aws-sdk")
+          const ses = new aws.SES({ region: "us-east-1" })
+          exports.handler = async (event, context, callback) => {
+            // required response parts
+            var response = {
+              "statusCode": 200,
+              "headers": {
+                "my_header": "my_value"
+              },
+              "body": JSON.stringify("Email sent"),
+              "isBase64Encoded": false
+            }
+
+            // ses send mail
+            const params = {
+              Destination: {
+                ToAddresses: ['REPLACE_THIS_TO_AN_EMAIL_TO_ADDRESS'],
+              },
+              Message: {
+                Body: {
+                  Text: { Data: "Test" },
+                },
+                Subject: { Data: "Test Email" },
+              },
+              Source: "REPLACE_THIS_TO_AN_EMAIL_FROM_ADDRESS",
+              ReplyToAddresses: ["REPLACE_THIS_TO_AN_EMAIL_REPLY_ADDRESS"],
+            }
+
+            // call the ses with params and await response
+            await ses.sendEmail(params).promise()
+              .then(res => console.log(res))
+              .catch(err => console.log(err))
+
+            // finish lambda
+            callback(null, response)
+          }
+
+  # GatewayIAMRole:
+  #   Type: AWS::IAM::Role
+  #   Properties:
+  #     AssumeRolePolicyDocument:
+  #       Version: 2012-10-17
+  #       Statement:
+  #         - Effect: 'Allow'
+  #           Action:
+  #             - 'sts:AssumeRole'
+  #           Principal:
+  #             Service:
+  #               - 'apigateway.amazonaws.com'
+  #     # Path: '/'
+  #     Policies:
+  #       - PolicyName: Whitelist
+  #         PolicyDocument:
+  #           Version: 2012-10-17
+  #           Statement:
+  #             - Effect: 'Allow'
+  #               Action: 'lambda:*'
+  #               Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/
+
+  LambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyName: lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}:*
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Effect: Allow
+                Resource: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LambdaFunctionName}
+      RetentionInDays: 7
+
+  # GatewayPolicy:
+  #   Type: AWS::IAM::Policy
+  #   Properties:
+      # - PolicyName: gateway
+      #   PolicyDocument:
+      #     Version: 2012-10-17
+      #     Statement:
+      #       - Effect: Allow
+      #         Principal: '*'
+      #         Action: execute-api:Invoke
+      #         Resource:
+      #           - execute-api:/*/*/*
+
+  # Register an API in API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: Print some beans
+      Policy:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: execute-api:Invoke
+            Resource: 'execute-api:/*/*/*'
+            Condition:
+              IpAddress:
+                aws:SourceIp:
+                - TYPE_YOUR_IP_HERE
+            # !Sub: arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/
+      # Policy:
+      #   - !Join
+      #     - ''
+      #     - - '{ "Version": "2012-10-17",'
+      #       - '  "Statement": ['
+      #       - '      {'
+      #       - '          "Effect": "Allow",'
+      #       - '          "Principal": "*",'
+      #       - '          "Action": "execute-api:Invoke",'
+      #       - '          "Resource": "arn:aws:execute-api:us-east-1:*:*/*",'
+      #       - '          "Condition": {'
+      #       - '              "IpAddress": {'
+      #       - '                  "aws:SourceIp": ['
+      #       - '                      "TYPE_YOUR_IP_HERE"'
+      #       - ']}}}]}'
+          
+      #   - PolicyName: gateway
+      #     PolicyDocument:
+      #       Version: 2012-10-17
+      #       Statement:
+      #         - Effect: Allow
+      #           Principal: '*'
+      #           Action: execute-api:Invoke
+      #           Resource:
+      #             - execute-api:/*/*/*
+            # Version: 2012-10-17
+            # Statement:
+            #   - Effect: Allow
+            #     Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:execute-api:*:*
+            #     Action: '*'
+            #     Condition:
+            #       IpAddress:
+            #         aws:SourceIp:
+            #           - TYPE_YOUR_IP_HERE
+
+
+
+  # Mark it as a "proxy" integration that forwards all requests to our Lambda function
+  ApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt LambdaFunction.Arn
+      ResourceId: !GetAtt ApiGateway.RootResourceId
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  # Enable logging of all HTTP requests
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiGatewayDeployment
+      MethodSettings:
+        - HttpMethod: '*'
+          LoggingLevel: INFO
+          ResourcePath: /*
+          DataTraceEnabled: true
+      RestApiId: !Ref ApiGateway
+      StageName: echo
+
+  # Grant permission for the newly created API to invoke our Lambda function
+  LambdaApiGatewayInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/
+
+Outputs:
+  ApiUrl:
+    Value: !Sub
+      - https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+      - ApiId: !Ref ApiGateway
+        StageName: !Ref ApiStage
+  LambdaARN:
+    Value: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${LambdaFunctionName}
